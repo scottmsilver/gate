@@ -4,7 +4,10 @@ import os
 import tempfile
 import logging
 
-# --- Global Configuration (can be moved or passed differently if needed) ---
+# Import the GPIO manager singleton
+from gpio_manager import manager as gpio_manager
+
+# --- Global Configuration ---
 RELAY_PINS_CONFIG = {
     1: 22, # Relay 1 -> GPIO 22
     2: 23, # Relay 2 -> GPIO 23
@@ -26,7 +29,7 @@ class RelayController:
         self.relay_pins = relay_pins
         self.state_file = state_file
         self.logger = logging.getLogger(logger_name)
-        self.relay_states = {relay_num: False for relay_num in self.relay_pins}
+        self.relay_states = {relay_num: False for relay_num in self.relay_pins} # Holds internal logical state
         self._is_setup = False
 
     def _load_state(self):
@@ -77,40 +80,42 @@ class RelayController:
 
     def setup(self):
         """Initializes GPIO, loads state, and applies initial pin states."""
-        if self._is_setup:
-            self.logger.warning("Setup already completed.")
-            return True
-        
         self.logger.info("Performing controller setup...")
-        self._load_state() # Load state before setting up GPIO
-        try:
-            GPIO.setmode(GPIO.BCM)
-            GPIO.setwarnings(False)
-            self.logger.info("Applying initial GPIO pin states...")
-            for relay_num, pin in self.relay_pins.items():
-                GPIO.setup(pin, GPIO.OUT)
-                current_state = self.relay_states.get(relay_num, False)
-                target_gpio_state = RELAY_ON_STATE if current_state else RELAY_OFF_STATE
-                GPIO.output(pin, target_gpio_state)
-                self.logger.debug(f"  Relay {relay_num} (GPIO {pin}) initially set to {'ON' if current_state else 'OFF'}")
-            self._is_setup = True
-            self.logger.info("Controller setup complete.")
-            return True
-        except Exception as e:
-            self.logger.error(f"GPIO setup failed: {e}", exc_info=True)
-            self.logger.error("Ensure running on RPi with permissions (sudo?).")
-            self._is_setup = False
-            return False # Indicate failure
+        # Rely on the manager being initialized by the application entry point
+        # Ensure GPIOManager is initialized (will raise error if not or conflicts)
+        # The mode/warnings setting should happen ONCE in the main app.
+        # We assume it's done before this controller's setup is called.
+        # gpio_manager.initialize() # DON'T initialize here, do it in main app script
+        
+        self._load_state() # Load logical state
+        self.logger.info("Setting up and applying initial pin states via GPIO Manager...")
+        for relay_num, pin in self.relay_pins.items():
+            # Setup pin using the manager
+            gpio_manager.setup_pin(pin, GPIO.OUT)
+            # Get logical state
+            current_state = self.relay_states.get(relay_num, False)
+            # Determine target GPIO state (LOW=ON, HIGH=OFF)
+            target_gpio_state = RELAY_ON_STATE if current_state else RELAY_OFF_STATE
+            # Set initial output using the manager
+            gpio_manager.set_output(pin, target_gpio_state)
+            self.logger.debug(f"  Relay {relay_num} (GPIO {pin}) initially set to {'ON' if current_state else 'OFF'}")
+        self._is_setup = True
+        self.logger.info("Controller setup complete.")
+        return True
 
     def cleanup(self):
         """Cleans up GPIO resources if setup was successful."""
-        if self._is_setup:
-            self.logger.info("Cleaning up GPIO...")
-            GPIO.cleanup()
-            self.logger.info("GPIO cleanup complete.")
-            self._is_setup = False # Mark as cleaned up
-        else:
-            self.logger.warning("Skipping cleanup as GPIO was not successfully setup.")
+        # This controller NO LONGER performs GPIO.cleanup().
+        # The main application using the GPIOManager is responsible for calling manager.cleanup_all()
+        # We might want to release pins from the manager here if needed, but often not necessary.
+        self.logger.info("Controller cleanup phase. GPIO hardware cleanup deferred to GPIOManager.")
+        # Example: If we wanted to mark pins as no longer used by this controller:
+        # if self._is_setup:
+        #    for pin in self.relay_pins.values():
+        #        try: gpio_manager.release_pin(pin)
+        #        except Exception as e: self.logger.warning(f"Error releasing pin {pin}: {e}")
+        
+        self._is_setup = False # Mark controller as logically cleaned up
 
     def get_relay_state(self, relay_num):
         """Gets the current state of a specific relay."""
@@ -128,16 +133,18 @@ class RelayController:
         if not self._is_setup:
             self.logger.error("Cannot set relay: Controller not set up.")
             return False
-        if relay_num not in self.relay_pins:
-            self.logger.warning(f"Attempted to set invalid relay: {relay_num}")
-            return False
+        pin = self.relay_pins.get(relay_num)
+        if pin is None:
+             self.logger.warning(f"Attempted to set invalid relay number: {relay_num}")
+             return False
 
-        pin = self.relay_pins[relay_num]
         target_state_bool = bool(state) # Ensure boolean
         target_gpio_state = RELAY_ON_STATE if target_state_bool else RELAY_OFF_STATE
         
         try:
-            GPIO.output(pin, target_gpio_state)
+            # Use the manager to set the output
+            gpio_manager.set_output(pin, target_gpio_state)
+            # Update internal logical state
             self.relay_states[relay_num] = target_state_bool
             self.logger.info(f"Set Relay {relay_num} (GPIO {pin}) to {'ON' if target_state_bool else 'OFF'}")
             self._save_state() # Persist the change

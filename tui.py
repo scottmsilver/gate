@@ -6,6 +6,10 @@ import traceback
 
 # Import the controller and configuration from the library file
 from relay_control import RelayController, RELAY_PINS_CONFIG, DEFAULT_STATE_FILE, DEFAULT_LOG_FILE
+import RPi.GPIO as GPIO # Keep for constants if needed
+
+# Import the manager
+from gpio_manager import manager as gpio_manager
 
 # Note: This file assumes it will be run via curses.wrapper
 # and receive a configured RelayController instance.
@@ -105,32 +109,49 @@ def setup_logging(log_file=DEFAULT_LOG_FILE, level=logging.INFO):
     # Log the configuration attempt
     logging.getLogger(__name__).info(f"Logging configured. Level: {logging.getLevelName(level)}, File: {log_file}")
 
-# --- Main Execution Block (Entry point) ---
+def main():
+    """Main application entry point."""
+    logger = logging.getLogger(__name__)
+    setup_logging() # Setup logging first
+    logger.info("Starting Relay Control TUI Application")
+
+    try:
+        # Initialize the GPIO Manager FIRST (after logging is set up)
+        logger.info("Initializing GPIO Manager...")
+        gpio_manager.initialize() # Use default BCM mode and warnings=False
+        logger.info("GPIO Manager initialized.")
+
+        # Now create and setup the controller
+        controller = RelayController(relay_pins=RELAY_PINS_CONFIG, state_file=DEFAULT_STATE_FILE)
+        logger.info("Setting up Relay Controller...")
+        if not controller.setup():
+            logger.error("Failed to setup relay controller. Exiting.")
+            sys.exit(1) # Exit if setup fails
+        logger.info("Relay Controller setup complete.")
+
+        # Run the curses TUI wrapper via main()
+        logger.info("Starting Curses TUI wrapper...")
+        run_tui(controller)
+
+    except Exception as e:
+        # Basic fallback logging if main setup fails early
+        print(f"Unhandled exception before full logger setup: {e}")
+        print(traceback.format_exc())
+        # Fallback cleanup if manager might have been initialized
+        try:
+            gpio_manager.cleanup_all()
+        except Exception as cleanup_e:
+            print(f"Error during fallback cleanup: {cleanup_e}")
+        sys.exit(1)
+
+    finally:
+        # Cleanup is now handled within main's finally block
+        logger.info("Performing application cleanup...")
+        if 'controller' in locals() and controller is not None:
+            controller.cleanup() 
+        logger.info("Performing global GPIO cleanup via manager...")
+        gpio_manager.cleanup_all()
+        logger.info("Application finished.")
 
 if __name__ == "__main__":
-    setup_logging() # Configure logging first
-    main_logger = logging.getLogger(__name__)
-    main_logger.info("Starting Relay Control TUI Application")
-
-    # Create the controller instance using imported config
-    controller = RelayController(
-        relay_pins=RELAY_PINS_CONFIG, 
-        state_file=DEFAULT_STATE_FILE
-        # logger_name can be customized if needed, defaults to 'RelayController'
-    )
-
-    # Attempt to set up the controller (GPIO, initial state)
-    if not controller.setup():
-        main_logger.critical("Controller setup failed. Check logs and permissions. Exiting.")
-        sys.exit(1) # Exit if core setup fails
-
-    # Run the TUI itself
-    try:
-        run_tui(controller)
-    except Exception as e:
-        # Catch errors specific to the TUI run phase
-        main_logger.exception("An unexpected error occurred during TUI execution.")
-    finally:
-        # Ensure controller cleanup ALWAYS happens
-        controller.cleanup()
-        main_logger.info("Relay Control TUI Application Finished.")
+    main()
