@@ -3,6 +3,25 @@ import RPi.GPIO as GPIO
 import time
 import sys
 import traceback
+import json
+import os
+import tempfile
+import logging
+
+# --- Global Flags ---
+gpio_setup_successful = False # Track if GPIO setup completed
+
+# --- Logging Configuration ---
+LOG_FILE = "relay_control.log"
+logging.basicConfig(
+    level=logging.INFO, 
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler(LOG_FILE), 
+        # logging.StreamHandler() 
+    ]
+)
+logger = logging.getLogger(__name__) 
 
 # --- Configuration ---
 # Map relay numbers (1-4) to BCM GPIO pin numbers
@@ -17,36 +36,117 @@ RELAY_PINS = {
 RELAY_ON_STATE = GPIO.LOW
 RELAY_OFF_STATE = GPIO.HIGH
 
+# State file path
+STATE_FILE = "relay_state.json"
+
 # Dictionary to keep track of the current state of each relay (True = ON, False = OFF)
+# Initialize with defaults, will be overwritten by load_state if file exists
 relay_states = {relay_num: False for relay_num in RELAY_PINS}
-# --- End Configuration ---
+
+def load_state():
+    """Loads relay states from the state file if it exists."""
+    global relay_states
+    if os.path.exists(STATE_FILE):
+        try:
+            with open(STATE_FILE, 'r') as f:
+                loaded_states_str_keys = json.load(f)
+                # Convert string keys from JSON back to integers
+                loaded_states = {int(k): v for k, v in loaded_states_str_keys.items()}
+
+                # Validate loaded state keys match current config
+                if set(loaded_states.keys()) == set(RELAY_PINS.keys()):
+                    relay_states.update(loaded_states)
+                    logger.info(f"Loaded state from {STATE_FILE}: {relay_states}")
+                else:
+                    logger.warning(f"State file {STATE_FILE} keys mismatch config. Using defaults.")
+                    # Optionally: delete or rename the invalid state file here
+        except (json.JSONDecodeError, IOError, ValueError) as e:
+            logger.error(f"Error loading state from {STATE_FILE}: {e}. Using default states.", exc_info=True)
+            # Reset to default states in case partial load occurred or file was corrupt
+            relay_states = {relay_num: False for relay_num in RELAY_PINS}
+        except Exception as e:
+            logger.exception(f"Unexpected error loading state: {e}. Using default states.")
+            relay_states = {relay_num: False for relay_num in RELAY_PINS}
+    else:
+        logger.info(f"State file {STATE_FILE} not found. Initializing with default OFF states.")
+
+def save_state():
+    """Saves the current relay states atomically to the state file."""
+    temp_file_path = None
+    try:
+        # Create a temporary file in the same directory to ensure atomic rename works
+        # across filesystems (though usually not an issue in this context)
+        # delete=False is important so we can rename it later
+        with tempfile.NamedTemporaryFile(mode='w', dir=os.path.dirname(STATE_FILE), 
+                                        prefix=os.path.basename(STATE_FILE) + '.tmp', 
+                                        delete=False) as tf:
+            temp_file_path = tf.name
+            json.dump(relay_states, tf, indent=4)
+            # Ensure data is written to the OS buffer
+            tf.flush()
+            # Ensure data is written from OS buffer to disk
+            os.fsync(tf.fileno())
+        
+        # Atomically replace the old state file with the new one
+        os.rename(temp_file_path, STATE_FILE)
+        logger.debug(f"Atomically saved state to {STATE_FILE}") 
+
+    except (IOError, OSError, json.JSONDecodeError) as e:
+        logger.error(f"Error saving state atomically to {STATE_FILE}: {e}", exc_info=True)
+        # Clean up the temporary file if it still exists after an error
+        if temp_file_path and os.path.exists(temp_file_path):
+            try:
+                os.remove(temp_file_path)
+            except OSError as remove_err:
+                logger.error(f"Error removing temporary state file {temp_file_path}: {remove_err}", exc_info=True)
+    except Exception as e:
+        logger.exception(f"Unexpected error saving state: {e}")
+        # Clean up the temporary file if it still exists after an error
+        if temp_file_path and os.path.exists(temp_file_path):
+            try:
+                os.remove(temp_file_path)
+            except OSError as remove_err:
+                logger.error(f"Error removing temporary state file {temp_file_path}: {remove_err}", exc_info=True)
 
 def setup_gpio():
-    """Initializes GPIO pins for relay control."""
+    """Initializes GPIO pins for relay control, loading previous state."""
+    global gpio_setup_successful # Declare intent to modify global flag
+    # Load state from file first
+    load_state()
+
     try:
         GPIO.setmode(GPIO.BCM)  # Use Broadcom pin numbering scheme
         GPIO.setwarnings(False) # Disable GPIO warnings
+
+        logger.info("Applying loaded/default states to GPIO pins...")
         for relay_num, pin in RELAY_PINS.items():
             GPIO.setup(pin, GPIO.OUT)
-            # Set initial state to OFF
-            GPIO.output(pin, RELAY_OFF_STATE)
-            relay_states[relay_num] = False
-        print("GPIO setup complete.")
+            # Set pin state based on loaded/default state
+            current_state = relay_states.get(relay_num, False) # Default to False if somehow missing
+            target_gpio_state = RELAY_ON_STATE if current_state else RELAY_OFF_STATE
+            GPIO.output(pin, target_gpio_state)
+            logger.debug(f"  Relay {relay_num} (GPIO {pin}) set to {'ON' if current_state else 'OFF'}") 
+
+        logger.info("GPIO setup complete.")
+        gpio_setup_successful = True # Set flag on successful completion
+
     except Exception as e:
         # GPIO setup can fail if permissions are insufficient or not on RPi
-        print(f"Error setting up GPIO: {e}", file=sys.stderr)
-        print("Ensure you are running on a Raspberry Pi and have necessary permissions (e.g., run with 'sudo' or user in 'gpio' group).", file=sys.stderr)
+        logger.error(f"Error setting up GPIO: {e}", exc_info=True)
+        logger.error("Ensure you are running on a Raspberry Pi and have necessary permissions (e.g., run with 'sudo').")
         raise # Re-raise the exception to be caught later
 
 def cleanup_gpio():
     """Resets GPIO pins to default state."""
-    print("\nCleaning up GPIO...")
+    logger.info("Cleaning up GPIO...")
+    # Note: We do NOT save state on cleanup, as cleanup often implies shutdown
+    # or error, and we want the state saved during normal operation.
     GPIO.cleanup()
-    print("GPIO cleanup complete.")
+    logger.info("GPIO cleanup complete.")
 
 def set_relay(relay_num, state):
     """
-    Sets a specific relay to the desired state.
+    Sets a specific relay to the desired state and saves the new state.
 
     Args:
         relay_num (int): The number of the relay (1-4).
@@ -60,6 +160,8 @@ def set_relay(relay_num, state):
     target_state = RELAY_ON_STATE if state else RELAY_OFF_STATE
     GPIO.output(pin, target_state)
     relay_states[relay_num] = state
+    logger.info(f"Set Relay {relay_num} (GPIO {RELAY_PINS[relay_num]}) to {'ON' if state else 'OFF'}")
+    save_state() # Save the state immediately after changing it
 
 def toggle_relay(relay_num):
     """Toggles the state of the specified relay."""
@@ -131,19 +233,22 @@ def main_loop(stdscr):
                 stdscr.clear() # Force redraw on next loop iteration
 
         except KeyboardInterrupt:
+            logger.info("KeyboardInterrupt received, exiting.")
             break # Allow Ctrl+C to exit gracefully
         except Exception as e:
              # Log unexpected errors if possible, then break
-             # In a real app, might log to a file
-             # For now, just break the loop
-             # Consider printing traceback outside curses wrapper
+             logger.exception("An error occurred during the main loop:")
              curses.endwin() # Ensure terminal is restored
-             print("An error occurred during the main loop:", file=sys.stderr)
-             traceback.print_exc()
+             # print("An error occurred during the main loop:", file=sys.stderr)
+             # traceback.print_exc()
              raise # Re-raise after ending curses
 
 def run_relay_control():
     """Sets up GPIO, runs the curses UI, and handles cleanup."""
+    logger.info("Starting Relay Control Application")
+    global gpio_setup_successful # Access the global flag
+    gpio_setup_successful = False # Ensure it's False at the start of each run
+
     try:
         # Attempt GPIO setup first
         setup_gpio()
@@ -151,25 +256,29 @@ def run_relay_control():
         # Run the curses application using wrapper for safe terminal handling
         curses.wrapper(main_loop)
 
-    except ImportError:
-        print("Error: RPi.GPIO library not found.", file=sys.stderr)
-        print("Please install it: 'uv pip install RPi.GPIO'", file=sys.stderr)
+    except ImportError as e:
+        logger.critical("RPi.GPIO library not found. Please install it: 'pip install RPi.GPIO'", exc_info=True)
+        # print("Error: RPi.GPIO library not found.", file=sys.stderr)
+        # print("Please install it: 'pip install RPi.GPIO'", file=sys.stderr)
     except RuntimeError as e:
         # RPi.GPIO often raises RuntimeError for permission issues or non-RPi hardware
-        print(f"Runtime Error: {e}", file=sys.stderr)
-        print("Ensure you are running on a Raspberry Pi with correct permissions.", file=sys.stderr)
+        logger.critical(f"Runtime Error during GPIO setup/access: {e}", exc_info=True)
+        logger.critical("Ensure you are running on a Raspberry Pi with correct permissions.")
+        # print(f"Runtime Error: {e}", file=sys.stderr)
+        # print("Ensure you are running on a Raspberry Pi with correct permissions.", file=sys.stderr)
     except Exception as e:
         # Catch any other unexpected errors during setup or curses init
-        print(f"An unexpected error occurred: {e}", file=sys.stderr)
-        traceback.print_exc()
+        logger.exception(f"An unexpected error occurred during initialization or shutdown: {e}")
+        # print(f"An unexpected error occurred: {e}", file=sys.stderr)
+        # traceback.print_exc()
     finally:
         # Attempt GPIO cleanup regardless of how the program exits
-        # Check if GPIO module was successfully imported and mode set
-        if 'GPIO' in sys.modules and GPIO.getmode() is not None:
+        # Check if GPIO setup was marked as successful
+        if gpio_setup_successful:
              cleanup_gpio()
         else:
-             print("Skipping GPIO cleanup as it wasn't initialized properly.")
-        print("Application finished.")
+             logger.warning("Skipping GPIO cleanup as setup did not complete successfully.")
+        logger.info("Relay Control Application Finished.")
 
 if __name__ == "__main__":
     run_relay_control()
