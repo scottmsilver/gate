@@ -47,10 +47,10 @@ The script requires root privileges to access GPIO pins.
     ```bash
     cd /path/to/gate 
     ```
-2.  **Run the Script:**
+2.  **Run the TUI Script:**
     ```bash
     # Make sure virtual environment is active or use the full path to python
-    sudo .venv/bin/python relay_control.py
+    sudo .venv/bin/python tui.py 
     ```
 3.  **Interface:**
     *   Press keys `1`, `2`, `3`, or `4` to toggle the corresponding relay.
