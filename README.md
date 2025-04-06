@@ -53,9 +53,11 @@ The script requires root privileges to access GPIO pins.
     sudo .venv/bin/python tui.py 
     ```
 3.  **Interface:**
-    *   Press keys `1`, `2`, `3`, or `4` to toggle the corresponding relay.
-    *   The status (ON/OFF) will update in the interface.
-    *   Press `q` to quit the application.
+    *   Keys `1`, `2`, `3`, `4`: Toggle the corresponding relay ON or OFF (persistent state).
+    *   Keys `a`, `b`, `c`, `d`: Momentarily turn ON relay 1, 2, 3, or 4 respectively for ~2 seconds.
+    *   Key `q`: Quit the application.
+    
+    The display shows the persistent state (ON/OFF) or indicates if a relay is currently being pulsed (PULSING).
 
 ## State and Logging
 

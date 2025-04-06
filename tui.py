@@ -3,6 +3,7 @@ import logging
 from functools import partial
 import sys
 import traceback
+import time
 
 # Import the controller and configuration from the library file
 from relay_control import RelayController, RELAY_PINS_CONFIG, DEFAULT_STATE_FILE, DEFAULT_LOG_FILE
@@ -22,7 +23,7 @@ def draw_interface(stdscr, controller):
     title = "Raspberry Pi Relay Control (TUI)" # Updated title slightly
     if w > len(title): stdscr.addstr(0, w // 2 - len(title) // 2, title, curses.A_BOLD)
 
-    instructions = "Toggle: [1-4] | Quit: [q]"
+    instructions = "Toggle: [1-4] | Momentary (2s): [a-d] | Quit: [q]"
     if h > 2 and w > len(instructions): stdscr.addstr(2, 1, instructions)
 
     y_offset = 4
@@ -30,16 +31,37 @@ def draw_interface(stdscr, controller):
     relay_pins = controller.relay_pins 
     all_states = controller.get_all_states()
 
+    # Initialize color pairs if possible
+    if curses.has_colors():
+        curses.init_pair(1, curses.COLOR_GREEN, curses.COLOR_BLACK) # ON
+        curses.init_pair(2, curses.COLOR_RED, curses.COLOR_BLACK)   # OFF
+        curses.init_pair(3, curses.COLOR_YELLOW, curses.COLOR_BLACK) # PULSING
+    COLOR_ON = curses.color_pair(1) if curses.has_colors() else curses.A_REVERSE
+    COLOR_OFF = curses.color_pair(2) if curses.has_colors() else curses.A_NORMAL
+    COLOR_PULSING = curses.color_pair(3) | curses.A_BOLD if curses.has_colors() else curses.A_BLINK
+
     for relay_num in sorted(relay_pins.keys()):
         if h > (y_offset + relay_num - 1) and w > 20:
             pin = relay_pins[relay_num]
-            is_on = all_states.get(relay_num, False)
-            state_str = "ON" if is_on else "OFF"
-            # Color pairs defined in main_curses_loop
-            color = curses.color_pair(1) if is_on else curses.color_pair(2)
-            status_line = f"Relay {relay_num} (GPIO {pin}): "
-            stdscr.addstr(y_offset + relay_num - 1, 2, status_line)
-            stdscr.addstr(state_str, color | curses.A_BOLD)
+            state_str = f"Relay {relay_num} (GPIO {pin}): "
+
+            # Check pulsing state first
+            if controller.is_pulsing(relay_num):
+                status = "PULSING"
+                color = COLOR_PULSING
+            else:
+                # Get persistent state if not pulsing
+                state = controller.get_relay_state(relay_num)
+                if state:
+                    status = "ON"
+                    color = COLOR_ON
+                else:
+                    status = "OFF"
+                    color = COLOR_OFF
+
+            # Draw relay status line
+            stdscr.addstr(y_offset + relay_num - 1, 2, state_str)
+            stdscr.addstr(status, color | curses.A_BOLD)
 
     stdscr.refresh()
 
@@ -48,11 +70,6 @@ def main_curses_loop(stdscr, controller):
     curses.curs_set(0)
     stdscr.nodelay(True)
     stdscr.timeout(200)
-
-    if curses.has_colors():
-        curses.start_color()
-        curses.init_pair(1, curses.COLOR_GREEN, curses.COLOR_BLACK)
-        curses.init_pair(2, curses.COLOR_RED, curses.COLOR_BLACK)
 
     logger = logging.getLogger(__name__) # Use logger from the main script's config
 
@@ -69,6 +86,18 @@ def main_curses_loop(stdscr, controller):
                 success = controller.toggle_relay(relay_num_to_toggle)
                 if not success:
                     logger.warning(f"Failed to toggle relay {relay_num_to_toggle}")
+            elif key == ord('a'):
+                logger.debug("Momentary key 'a' pressed for Relay 1.")
+                controller.pulse_relay(1)
+            elif key == ord('b'):
+                logger.debug("Momentary key 'b' pressed for Relay 2.")
+                controller.pulse_relay(2)
+            elif key == ord('c'):
+                logger.debug("Momentary key 'c' pressed for Relay 3.")
+                controller.pulse_relay(3)
+            elif key == ord('d'):
+                logger.debug("Momentary key 'd' pressed for Relay 4.")
+                controller.pulse_relay(4)
             elif key == curses.KEY_RESIZE:
                 stdscr.clear()
 

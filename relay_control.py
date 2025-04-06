@@ -3,6 +3,7 @@ import json
 import os
 import tempfile
 import logging
+import threading # Import threading for Timer and Lock
 
 # Import the GPIO manager singleton
 from gpio_manager import manager as gpio_manager
@@ -30,6 +31,8 @@ class RelayController:
         self.state_file = state_file
         self.logger = logging.getLogger(logger_name)
         self.relay_states = {relay_num: False for relay_num in self.relay_pins} # Holds internal logical state
+        self._pulsing_relays = {} # Tracks active pulses {relay_num: True}
+        self._pulsing_lock = threading.Lock() # Lock for accessing _pulsing_relays
         self._is_setup = False
 
     def _load_state(self):
@@ -129,10 +132,19 @@ class RelayController:
         return self.relay_states.copy() # Return a copy
 
     def set_relay(self, relay_num, state):
-        """Sets a specific relay to the desired state (True=ON, False=OFF)."""
+        """Sets the persistent state of a specific relay and saves it.
+
+        Will ignore the request if the relay is currently being pulsed.
+        """
         if not self._is_setup:
             self.logger.error("Cannot set relay: Controller not set up.")
             return False
+        
+        # Prevent changing persistent state while a momentary pulse is active
+        if self.is_pulsing(relay_num):
+            self.logger.warning(f"Ignoring set_relay({state}) for Relay {relay_num}: currently pulsing.")
+            return False # Indicate request was ignored due to conflict
+            
         pin = self.relay_pins.get(relay_num)
         if pin is None:
              self.logger.warning(f"Attempted to set invalid relay number: {relay_num}")
@@ -150,7 +162,7 @@ class RelayController:
             self._save_state() # Persist the change
             return True
         except Exception as e:
-            self.logger.error(f"Failed to set Relay {relay_num} (GPIO {pin}): {e}", exc_info=True)
+            self.logger.error(f"Failed to set Relay {relay_num} (GPIO {pin}) state to {target_state_bool}: {e}", exc_info=True)
             return False
 
     def toggle_relay(self, relay_num):
@@ -159,3 +171,69 @@ class RelayController:
         if current_state is None:
             return False # Invalid relay number
         return self.set_relay(relay_num, not current_state)
+
+    def is_pulsing(self, relay_num):
+        """Check if a relay is currently being pulsed."""
+        with self._pulsing_lock:
+            return relay_num in self._pulsing_relays
+
+    def pulse_relay(self, relay_num, duration_sec=2.0):
+        """Turns a relay ON momentarily for a specified duration, then OFF.
+
+        This does NOT affect the persistent state saved in the state file.
+        Uses a background thread timer to turn the relay off after the duration.
+        """
+        pin = self.relay_pins.get(relay_num)
+        if pin is None:
+            self.logger.warning(f"Attempted to pulse invalid relay number: {relay_num}")
+            return False
+        # Prevent starting a new pulse if one is already active for this relay
+        if self.is_pulsing(relay_num):
+            self.logger.debug(f"Ignoring pulse_relay for Relay {relay_num}: already pulsing.")
+            return False # Indicate request was ignored
+            
+        if not self._is_setup:
+            self.logger.error("Cannot pulse relay: Controller not set up.")
+            return False
+
+        def turn_off_action():
+            """Action executed by the timer to turn the relay off."""
+            try:
+                # Mark pulsing as finished *before* GPIO interaction (in case it fails)
+                with self._pulsing_lock:
+                    self._pulsing_relays.pop(relay_num, None)
+                
+                gpio_manager.set_output(pin, RELAY_OFF_STATE)
+                self.logger.info(f"Momentary pulse END: Relay {relay_num} (GPIO {pin}) turned OFF")
+            except Exception as e:
+                self.logger.error(f"Error turning off relay {relay_num} (GPIO {pin}) after pulse: {e}", exc_info=True)
+                # Ensure state is cleared even if GPIO fails
+                with self._pulsing_lock:
+                    self._pulsing_relays.pop(relay_num, None)
+
+        try:
+            self.logger.info(f"Momentary pulse START: Relay {relay_num} (GPIO {pin}) turning ON for {duration_sec}s")
+            
+            # Mark as pulsing *before* starting timer/output
+            with self._pulsing_lock:
+                self._pulsing_relays[relay_num] = True
+            
+            # Turn the relay ON
+            gpio_manager.set_output(pin, RELAY_ON_STATE)
+
+            # Schedule the turn-off action in a separate thread
+            timer = threading.Timer(duration_sec, turn_off_action)
+            timer.daemon = True # Allow program to exit even if timer thread is active (optional but good practice)
+            timer.start()
+            return True
+        except Exception as e:
+            self.logger.error(f"Error starting pulse for relay {relay_num} (GPIO {pin}): {e}", exc_info=True)
+            # Attempt to turn it off immediately if the 'on' command failed 
+            try:
+                gpio_manager.set_output(pin, RELAY_OFF_STATE)
+            except Exception:
+                pass # Ignore nested errors during emergency off
+            # Clear pulsing state if start failed
+            with self._pulsing_lock:
+                self._pulsing_relays.pop(relay_num, None)
+            return False
